@@ -3493,7 +3493,7 @@ func directIngestHostCertificatesDarwin(
 		return nil
 	}
 
-	return ds.UpdateHostCertificates(ctx, host.ID, host.UUID, certs)
+	return ds.UpdateHostCertificates(ctx, host.ID, host.UUID, certs, fleet.HostCertificateOriginOsquery)
 }
 
 func directIngestHostCertificatesWindows(
@@ -3591,7 +3591,7 @@ func directIngestHostCertificatesWindows(
 		return nil
 	}
 
-	return ds.UpdateHostCertificates(ctx, host.ID, host.UUID, certs)
+	return ds.UpdateHostCertificates(ctx, host.ID, host.UUID, certs, fleet.HostCertificateOriginOsquery)
 }
 
 func maybeUpdateLastRestartedAt(now time.Time, host *fleet.Host) {
