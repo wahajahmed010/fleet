@@ -198,6 +198,10 @@ func TestGetTeams(t *testing.T) {
 							Features: fleet.Features{
 								EnableHostUsers:         true,
 								EnableSoftwareInventory: true,
+								HistoricalData: fleet.HistoricalDataSettings{
+									Uptime:          true,
+									Vulnerabilities: true,
+								},
 							},
 						},
 					},
@@ -212,6 +216,10 @@ func TestGetTeams(t *testing.T) {
 							AgentOptions: &agentOpts,
 							Features: fleet.Features{
 								AdditionalQueries: &additionalQueries,
+								HistoricalData: fleet.HistoricalDataSettings{
+									Uptime:          true,
+									Vulnerabilities: true,
+								},
 							},
 							HostExpirySettings: fleet.HostExpirySettings{
 								HostExpiryEnabled: true,
