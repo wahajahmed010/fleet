@@ -29446,6 +29446,52 @@ func (s *integrationEnterpriseTestSuite) TestPolicyLabelsIncludeAll() {
 	}, http.StatusBadRequest)
 	require.Contains(t, extractServerErrorText(rejPatchResp.Body), fleet.ErrPolicyConflictingLabels.Error())
 
+	// 3b. ApplyPolicySpecs (GitOps) round-trip with include_all.
+	specName := "spec-include-all-" + t.Name()
+	s.Do("POST", "/api/latest/fleet/spec/policies", fleet.ApplyPolicySpecsRequest{
+		Specs: []*fleet.PolicySpec{{
+			Name:             specName,
+			Query:            "SELECT 1",
+			LabelsIncludeAll: []string{lblA.Name, lblB.Name},
+		}},
+	}, http.StatusOK)
+	// Verify it persisted with include_all.
+	allPolicies, err := s.ds.ListGlobalPolicies(ctx, fleet.ListOptions{})
+	require.NoError(t, err)
+	var specPolicy *fleet.Policy
+	for _, p := range allPolicies {
+		if p.Name == specName {
+			specPolicy = p
+			break
+		}
+	}
+	require.NotNil(t, specPolicy, "policy created via spec should exist")
+	require.Len(t, specPolicy.LabelsIncludeAll, 2)
+	require.Empty(t, specPolicy.LabelsIncludeAny)
+	require.Empty(t, specPolicy.LabelsExcludeAny)
+
+	// Spec mutex rejection: include_all + include_any.
+	rejSpecResp := s.Do("POST", "/api/latest/fleet/spec/policies", fleet.ApplyPolicySpecsRequest{
+		Specs: []*fleet.PolicySpec{{
+			Name:             "spec-rej-any-" + t.Name(),
+			Query:            "SELECT 1",
+			LabelsIncludeAll: []string{lblA.Name},
+			LabelsIncludeAny: []string{lblB.Name},
+		}},
+	}, http.StatusBadRequest)
+	require.Contains(t, extractServerErrorText(rejSpecResp.Body), fleet.ErrPolicyConflictingLabels.Error())
+
+	// Spec mutex rejection: include_all + exclude_any.
+	rejSpecResp2 := s.Do("POST", "/api/latest/fleet/spec/policies", fleet.ApplyPolicySpecsRequest{
+		Specs: []*fleet.PolicySpec{{
+			Name:             "spec-rej-excl-" + t.Name(),
+			Query:            "SELECT 1",
+			LabelsIncludeAll: []string{lblA.Name},
+			LabelsExcludeAny: []string{lblB.Name},
+		}},
+	}, http.StatusBadRequest)
+	require.Contains(t, extractServerErrorText(rejSpecResp2.Body), fleet.ErrPolicyConflictingLabels.Error())
+
 	// 4. End-to-end host targeting: only hostBoth should match the include_all policy.
 	policy, err := s.ds.Policy(ctx, createResp.Policy.ID)
 	require.NoError(t, err)
@@ -29521,6 +29567,37 @@ func (s *integrationEnterpriseTestSuite) TestQueryLabelsIncludeAll() {
 	}, http.StatusBadRequest)
 	require.Contains(t, extractServerErrorText(rejPatchResp.Body), fleet.ErrQueryConflictingLabels.Error())
 
+	// ApplyQuerySpecs (GitOps) round-trip with include_all.
+	specQueryName := "q-spec-include-all-" + t.Name()
+	s.Do("POST", "/api/latest/fleet/spec/queries", fleet.ApplyQuerySpecsRequest{
+		Specs: []*fleet.QuerySpec{{
+			Name:             specQueryName,
+			Query:            "SELECT 1",
+			Logging:          fleet.LoggingSnapshot,
+			Interval:         60,
+			LabelsIncludeAll: []string{lblA.Name, lblB.Name},
+		}},
+	}, http.StatusOK)
+	// QueryByName does not load labels; use Query(ctx, id) to load them.
+	specQueryStub, err := s.ds.QueryByName(ctx, nil, specQueryName)
+	require.NoError(t, err)
+	specQuery, err := s.ds.Query(ctx, specQueryStub.ID)
+	require.NoError(t, err)
+	require.Len(t, specQuery.LabelsIncludeAll, 2)
+	require.Empty(t, specQuery.LabelsIncludeAny)
+
+	// Spec mutex rejection: include_all + include_any.
+	rejSpecResp := s.Do("POST", "/api/latest/fleet/spec/queries", fleet.ApplyQuerySpecsRequest{
+		Specs: []*fleet.QuerySpec{{
+			Name:             "q-spec-rej-" + t.Name(),
+			Query:            "SELECT 1",
+			Logging:          fleet.LoggingSnapshot,
+			LabelsIncludeAll: []string{lblA.Name},
+			LabelsIncludeAny: []string{lblB.Name},
+		}},
+	}, http.StatusBadRequest)
+	require.Contains(t, extractServerErrorText(rejSpecResp.Body), fleet.ErrQueryConflictingLabels.Error())
+
 	// Switch back to include_all so the end-to-end test below uses it.
 	s.DoJSON("PATCH", fmt.Sprintf("/api/latest/fleet/queries/%d", createResp.Query.ID), fleet.QueryPayload{
 		LabelsIncludeAll: []string{lblA.Name, lblB.Name},
@@ -29560,4 +29637,77 @@ func (s *integrationEnterpriseTestSuite) TestQueryLabelsIncludeAll() {
 	require.False(t, hasQueryFor(hostNone.ID), "host with no labels should not match include_all query")
 	require.False(t, hasQueryFor(hostA.ID), "host with one of two required labels should not match include_all query")
 	require.True(t, hasQueryFor(hostBoth.ID), "host with both required labels should match include_all query")
+}
+
+func (s *integrationEnterpriseTestSuite) TestApplyPolicySpecsBatchMixedScopes() {
+	t := s.T()
+	ctx := context.Background()
+
+	var lblResp fleet.CreateLabelResponse
+	s.DoJSON("POST", "/api/latest/fleet/labels", fleet.LabelPayload{Name: uuid.NewString(), Query: "SELECT 1"}, http.StatusOK, &lblResp)
+	lblA := lblResp.Label
+	lblResp = fleet.CreateLabelResponse{}
+	s.DoJSON("POST", "/api/latest/fleet/labels", fleet.LabelPayload{Name: uuid.NewString(), Query: "SELECT 2"}, http.StatusOK, &lblResp)
+	lblB := lblResp.Label
+
+	validAnyName := "batch-any-" + t.Name()
+	validAllName := "batch-all-" + t.Name()
+	invalidName := "batch-invalid-" + t.Name()
+
+	assertNonePersisted := func(label string) {
+		policies, err := s.ds.ListGlobalPolicies(ctx, fleet.ListOptions{})
+		require.NoError(t, err)
+		for _, p := range policies {
+			require.NotEqual(t, validAnyName, p.Name, "%s: no spec from rejected batch should persist", label)
+			require.NotEqual(t, validAllName, p.Name, "%s: no spec from rejected batch should persist", label)
+			require.NotEqual(t, invalidName, p.Name, "%s: no spec from rejected batch should persist", label)
+		}
+	}
+
+	// Batch with the mutex-violating spec at the END — proves we don't persist
+	// preceding valid specs once a later one fails validation.
+	rejResp := s.Do("POST", "/api/latest/fleet/spec/policies", fleet.ApplyPolicySpecsRequest{
+		Specs: []*fleet.PolicySpec{
+			{Name: validAnyName, Query: "SELECT 1", LabelsIncludeAny: []string{lblA.Name}},
+			{Name: validAllName, Query: "SELECT 1", LabelsIncludeAll: []string{lblA.Name, lblB.Name}},
+			{Name: invalidName, Query: "SELECT 1", LabelsIncludeAll: []string{lblA.Name}, LabelsExcludeAny: []string{lblB.Name}},
+		},
+	}, http.StatusBadRequest)
+	require.Contains(t, extractServerErrorText(rejResp.Body), fleet.ErrPolicyConflictingLabels.Error())
+	assertNonePersisted("violator-last")
+
+	// Batch with the mutex-violating spec at the FRONT — proves we don't persist
+	// trailing valid specs after a per-spec validation pass that the loop never reaches.
+	rejResp = s.Do("POST", "/api/latest/fleet/spec/policies", fleet.ApplyPolicySpecsRequest{
+		Specs: []*fleet.PolicySpec{
+			{Name: invalidName, Query: "SELECT 1", LabelsIncludeAll: []string{lblA.Name}, LabelsExcludeAny: []string{lblB.Name}},
+			{Name: validAnyName, Query: "SELECT 1", LabelsIncludeAny: []string{lblA.Name}},
+			{Name: validAllName, Query: "SELECT 1", LabelsIncludeAll: []string{lblA.Name, lblB.Name}},
+		},
+	}, http.StatusBadRequest)
+	require.Contains(t, extractServerErrorText(rejResp.Body), fleet.ErrPolicyConflictingLabels.Error())
+	assertNonePersisted("violator-first")
+
+	// Fully-valid 3-spec batch (one per scope) succeeds.
+	validExclName := "batch-excl-" + t.Name()
+	s.Do("POST", "/api/latest/fleet/spec/policies", fleet.ApplyPolicySpecsRequest{
+		Specs: []*fleet.PolicySpec{
+			{Name: validAnyName, Query: "SELECT 1", LabelsIncludeAny: []string{lblA.Name}},
+			{Name: validAllName, Query: "SELECT 1", LabelsIncludeAll: []string{lblA.Name, lblB.Name}},
+			{Name: validExclName, Query: "SELECT 1", LabelsExcludeAny: []string{lblB.Name}},
+		},
+	}, http.StatusOK)
+
+	policies, err := s.ds.ListGlobalPolicies(ctx, fleet.ListOptions{})
+	require.NoError(t, err)
+	byName := make(map[string]*fleet.Policy, len(policies))
+	for _, p := range policies {
+		byName[p.Name] = p
+	}
+	require.Contains(t, byName, validAnyName)
+	require.Contains(t, byName, validAllName)
+	require.Contains(t, byName, validExclName)
+	require.Len(t, byName[validAnyName].LabelsIncludeAny, 1)
+	require.Len(t, byName[validAllName].LabelsIncludeAll, 2)
+	require.Len(t, byName[validExclName].LabelsExcludeAny, 1)
 }
