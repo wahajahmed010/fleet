@@ -708,19 +708,21 @@ func applyQuerySpecsEndpoint(ctx context.Context, request interface{}, svc fleet
 }
 
 func (svc *Service) ApplyQuerySpecs(ctx context.Context, specs []*fleet.QuerySpec) error {
-	// Label scoping is a premium-only feature only
-	if !license.IsPremium(ctx) {
-		for _, spec := range specs {
-			if len(spec.LabelsIncludeAny) > 0 || len(spec.LabelsIncludeAll) > 0 {
-				setAuthCheckedOnPreAuthErr(ctx)
-				return fleet.ErrMissingLicense
-			}
-		}
-	}
-
-	// 1. Turn specs into queries.
-	queries := []*fleet.Query{}
+	// 1. Validate each spec (nil, premium label scoping, payload verification)
+	// and turn it into a query. Fail-fast on the first invalid spec.
+	isPremium := license.IsPremium(ctx)
+	queries := make([]*fleet.Query, 0, len(specs))
 	for _, spec := range specs {
+		if spec == nil {
+			setAuthCheckedOnPreAuthErr(ctx)
+			return ctxerr.Wrap(ctx, &fleet.BadRequestError{
+				Message: "invalid query spec: nil",
+			})
+		}
+		if !isPremium && (len(spec.LabelsIncludeAny) > 0 || len(spec.LabelsIncludeAll) > 0) {
+			setAuthCheckedOnPreAuthErr(ctx)
+			return fleet.ErrMissingLicense
+		}
 		if err := spec.Verify(); err != nil {
 			setAuthCheckedOnPreAuthErr(ctx)
 			return ctxerr.Wrap(ctx, &fleet.BadRequestError{
